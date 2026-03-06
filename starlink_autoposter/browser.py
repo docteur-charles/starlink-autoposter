@@ -104,6 +104,34 @@ class BrowserManager:
         )
         return None
 
+    def _find_firefox_binary(self) -> Optional[str]:
+        """
+        Recherche le binaire Firefox sur le système.
+        Gère les installations classiques, Snap et Flatpak.
+        """
+        import shutil
+
+        # Chemins possibles du binaire Firefox selon le type d'installation
+        candidates = [
+            shutil.which("firefox"),              # Dans le PATH (cas standard)
+            "/usr/bin/firefox",                    # Installation classique apt/deb
+            "/snap/bin/firefox",                   # Snap (Ubuntu 22.04+)
+            "/usr/lib/firefox/firefox",            # Certaines distros
+            "/usr/lib64/firefox/firefox",          # Fedora 64-bit
+        ]
+
+        for path in candidates:
+            if path and os.path.isfile(path) and os.access(path, os.X_OK):
+                self._log(f"Binaire Firefox trouvé : {path}")
+                return path
+
+        self._log(
+            "Binaire Firefox introuvable. "
+            "Installez Firefox : sudo apt install firefox",
+            "error",
+        )
+        return None
+
     def launch(self) -> bool:
         """
         Lance Firefox avec le profil configuré.
@@ -125,6 +153,11 @@ class BrowserManager:
             options = FirefoxOptions()
             options.add_argument("-profile")
             options.add_argument(profile_path)
+
+            # Spécifier le binaire Firefox explicitement (Snap, Flatpak, classique)
+            firefox_bin = self._find_firefox_binary()
+            if firefox_bin:
+                options.binary_location = firefox_bin
 
             self.driver = webdriver.Firefox(options=options)
             self.driver.get("https://www.starlink.com/account")
