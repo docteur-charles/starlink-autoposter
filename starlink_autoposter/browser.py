@@ -51,30 +51,48 @@ class BrowserManager:
             self.driver = None
             return False
 
+    def _get_firefox_base_dirs(self) -> list:
+        """
+        Retourne la liste des répertoires possibles contenant les profils Firefox.
+        Gère les installations classiques, Snap et Flatpak.
+        """
+        home = os.path.expanduser("~")
+
+        if os.name == "nt":
+            # Windows
+            return [os.path.join(home, r"AppData\Roaming\Mozilla\Firefox\Profiles")]
+
+        # Linux / macOS : plusieurs emplacements possibles
+        return [
+            os.path.join(home, ".mozilla", "firefox"),                            # Installation classique (apt, .deb)
+            os.path.join(home, "snap", "firefox", "common", ".mozilla", "firefox"),  # Snap (Ubuntu 22.04+)
+            os.path.join(home, ".var", "app", "org.mozilla.firefox", ".mozilla", "firefox"),  # Flatpak
+        ]
+
     def _find_profile_path(self) -> Optional[str]:
         """
         Recherche le chemin du profil Firefox correspondant au nom configuré.
-        Cherche dans le répertoire standard de Firefox selon l'OS.
+        Parcourt tous les emplacements possibles (classique, Snap, Flatpak).
         """
-        if os.name == "nt":
-            # Windows
-            base = os.path.expanduser(r"~\AppData\Roaming\Mozilla\Firefox\Profiles")
-        else:
-            # Linux / macOS
-            base = os.path.expanduser("~/.mozilla/firefox")
+        tried_dirs = []
 
-        if not os.path.isdir(base):
-            self._log(f"Répertoire Firefox introuvable : {base}", "warning")
-            return None
+        for base in self._get_firefox_base_dirs():
+            if not os.path.isdir(base):
+                tried_dirs.append(base)
+                continue
 
-        matches = glob.glob(os.path.join(base, f"*{self.profile_name}*"))
-        if matches:
-            self._log(f"Profil Firefox trouvé : {matches[0]}")
-            return matches[0]
+            matches = glob.glob(os.path.join(base, f"*{self.profile_name}*"))
+            if matches:
+                self._log(f"Profil Firefox trouvé : {matches[0]}")
+                return matches[0]
+
+            tried_dirs.append(base)
 
         self._log(
-            f"Profil Firefox '{self.profile_name}' non trouvé dans {base}. "
-            "Créez un profil Firefox nommé ainsi ou changez le nom dans la configuration.",
+            f"Profil Firefox '{self.profile_name}' non trouvé. "
+            f"Emplacements vérifiés : {', '.join(tried_dirs)}. "
+            "Créez un profil Firefox nommé ainsi via about:profiles "
+            "ou changez le nom dans la configuration.",
             "warning",
         )
         return None
