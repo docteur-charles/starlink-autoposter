@@ -11,8 +11,15 @@ import logging
 from typing import Optional, Callable
 
 import requests
-from selenium import webdriver
-from selenium.webdriver.firefox.options import Options as FirefoxOptions
+
+try:
+    from selenium import webdriver
+    from selenium.webdriver.firefox.options import Options as FirefoxOptions
+except ImportError as e:
+    raise ImportError(
+        f"Selenium non disponible ou version incompatible : {e}. "
+        "Installez avec : pip install selenium>=4.15.0"
+    ) from e
 
 logger = logging.getLogger(__name__)
 
