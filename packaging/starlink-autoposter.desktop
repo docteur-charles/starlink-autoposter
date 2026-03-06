@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Starlink AutoPoster - Saadaw Systems
+Comment=Gestion automatique des abonnements Starlink - Saadaw Systems
+Exec=starlink-autoposter
+Terminal=false
+Type=Application
+Categories=Utility;Network;
+Keywords=starlink;autoposter;subscription;
+StartupNotify=true

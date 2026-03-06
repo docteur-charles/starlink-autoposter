@@ -1,0 +1,114 @@
+# ==============================================================
+# Workflow de build multi-plateforme pour Starlink AutoPoster
+# Genere le .exe Windows et le binaire Linux a chaque push/tag.
+# Les artefacts sont telechargeables depuis l'onglet Actions.
+# ==============================================================
+
+name: Build Starlink AutoPoster
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  # =============================================
+  # Build Windows (.exe)
+  # =============================================
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Installer les dependances
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build .exe avec PyInstaller
+        run: |
+          pyinstaller packaging/starlink-autoposter.spec --distpath build/dist --workpath build/work --clean -y
+
+      - name: Upload .exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: starlink-autoposter-windows
+          path: build/dist/starlink-autoposter.exe
+
+  # =============================================
+  # Build Linux (binaire + .deb)
+  # =============================================
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Installer les dependances systeme
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+
+      - name: Installer les dependances Python
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build binaire avec PyInstaller
+        run: |
+          pyinstaller packaging/starlink-autoposter.spec --distpath build/dist --workpath build/work --clean -y
+
+      - name: Build .deb
+        run: |
+          ARCH=$(dpkg --print-architecture)
+          VERSION="1.0.0"
+          PKG_NAME="starlink-autoposter"
+          DEB_ROOT="build/deb/${PKG_NAME}_${VERSION}_${ARCH}"
+
+          mkdir -p "${DEB_ROOT}/DEBIAN"
+          mkdir -p "${DEB_ROOT}/usr/bin"
+          mkdir -p "${DEB_ROOT}/usr/share/applications"
+          mkdir -p "${DEB_ROOT}/usr/share/doc/${PKG_NAME}"
+
+          cp build/dist/starlink-autoposter "${DEB_ROOT}/usr/bin/"
+          chmod 755 "${DEB_ROOT}/usr/bin/starlink-autoposter"
+          cp packaging/starlink-autoposter.desktop "${DEB_ROOT}/usr/share/applications/"
+
+          INSTALLED_SIZE=$(du -sk "${DEB_ROOT}/usr" | cut -f1)
+          cat > "${DEB_ROOT}/DEBIAN/control" << EOF
+          Package: ${PKG_NAME}
+          Version: ${VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: ${ARCH}
+          Depends: firefox | firefox-esr
+          Installed-Size: ${INSTALLED_SIZE}
+          Maintainer: Saadaw Systems <contact@saadaw-systems.org>
+          Homepage: https://saadaw-systems.org
+          Description: Starlink AutoPoster - Saadaw Systems
+           Application de gestion automatique des abonnements Starlink.
+          EOF
+
+          dpkg-deb --build --root-owner-group "${DEB_ROOT}"
+
+      - name: Upload binaire Linux
+        uses: actions/upload-artifact@v4
+        with:
+          name: starlink-autoposter-linux
+          path: build/dist/starlink-autoposter
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: starlink-autoposter-deb
+          path: build/deb/*.deb
