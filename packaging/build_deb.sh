@@ -24,7 +24,12 @@ echo "Architecture : ${ARCH}"
 echo "Projet      : ${PROJECT_DIR}"
 echo ""
 
-# 1. Installer les dépendances de build
+# 1. Créer un venv de build et installer les dépendances
+VENV_DIR="${BUILD_DIR}/venv"
+echo ">>> Création du venv de build..."
+python3 -m venv "${VENV_DIR}"
+source "${VENV_DIR}/bin/activate"
+
 echo ">>> Installation des dépendances de build..."
 pip install --quiet pyinstaller
 pip install --quiet -r "${PROJECT_DIR}/requirements.txt"

@@ -1,25 +1,22 @@
 """
-Gestion du navigateur Firefox via Selenium.
-Détecte le profil Firefox local, lance le navigateur,
-et extrait les cookies d'authentification Starlink.
+Gestion des cookies Firefox pour l'authentification Starlink.
+Lit les cookies directement depuis la base SQLite du profil Firefox,
+sans utiliser Selenium (évite la détection hCaptcha/Cloudflare).
+Ouvre Firefox en mode normal pour la connexion manuelle.
 """
 
 import glob
 import os
+import shutil
+import signal
+import sqlite3
+import subprocess
+import tempfile
 import time
 import logging
-from typing import Optional, Callable
+from typing import Optional, Callable, List, Dict
 
 import requests
-
-try:
-    from selenium import webdriver
-    from selenium.webdriver.firefox.options import Options as FirefoxOptions
-except ImportError as e:
-    raise ImportError(
-        f"Selenium non disponible ou version incompatible : {e}. "
-        "Installez avec : pip install selenium>=4.15.0"
-    ) from e
 
 logger = logging.getLogger(__name__)
 
@@ -35,28 +32,16 @@ def _default_log(message: str, level: str = "info"):
 
 class BrowserManager:
     """
-    Gestionnaire du navigateur Firefox.
-    Gère le cycle de vie du driver Selenium et l'extraction des cookies.
-    Le navigateur reste ouvert entre les cycles pour réutiliser la session.
+    Gestionnaire des cookies Firefox pour Starlink.
+    Lit les cookies d'authentification directement depuis cookies.sqlite
+    du profil Firefox, sans passer par Selenium.
     """
 
     def __init__(self, profile_name: str = "starlink", log_callback: Optional[LogCallback] = None):
         self.profile_name = profile_name
-        self.driver: Optional[webdriver.Firefox] = None
         self._log = log_callback or _default_log
-
-    @property
-    def is_alive(self) -> bool:
-        """Vérifie si le navigateur est toujours ouvert et réactif."""
-        if not self.driver:
-            return False
-        try:
-            # Accéder à current_url déclenche une exception si le navigateur est fermé
-            _ = self.driver.current_url
-            return True
-        except Exception:
-            self.driver = None
-            return False
+        self._profile_path: Optional[str] = None
+        self._firefox_process: Optional[subprocess.Popen] = None
 
     def _get_firefox_base_dirs(self) -> list:
         """
@@ -81,6 +66,9 @@ class BrowserManager:
         Recherche le chemin du profil Firefox correspondant au nom configuré.
         Parcourt tous les emplacements possibles (classique, Snap, Flatpak).
         """
+        if self._profile_path and os.path.isdir(self._profile_path):
+            return self._profile_path
+
         tried_dirs = []
 
         for base in self._get_firefox_base_dirs():
@@ -91,6 +79,7 @@ class BrowserManager:
             matches = glob.glob(os.path.join(base, f"*{self.profile_name}*"))
             if matches:
                 self._log(f"Profil Firefox trouvé : {matches[0]}")
+                self._profile_path = matches[0]
                 return matches[0]
 
             tried_dirs.append(base)
@@ -104,123 +93,200 @@ class BrowserManager:
         )
         return None
 
-    def _find_firefox_binary(self) -> Optional[str]:
+    def _read_cookies_from_sqlite(self, profile_path: str) -> List[Dict]:
         """
-        Recherche le binaire Firefox sur le système.
-        Gère les installations classiques, Snap et Flatpak.
+        Lit les cookies Starlink depuis le fichier cookies.sqlite du profil Firefox.
+        Copie le fichier dans un répertoire temporaire pour éviter les conflits
+        de verrouillage si Firefox est ouvert.
         """
-        import shutil
+        cookies_db = os.path.join(profile_path, "cookies.sqlite")
+        if not os.path.isfile(cookies_db):
+            self._log(f"Fichier cookies.sqlite introuvable dans {profile_path}", "error")
+            return []
 
-        # Chemins possibles du binaire Firefox selon le type d'installation
-        candidates = [
-            shutil.which("firefox"),              # Dans le PATH (cas standard)
-            "/usr/bin/firefox",                    # Installation classique apt/deb
-            "/snap/bin/firefox",                   # Snap (Ubuntu 22.04+)
-            "/usr/lib/firefox/firefox",            # Certaines distros
-            "/usr/lib64/firefox/firefox",          # Fedora 64-bit
-        ]
+        cookies = []
+        tmp_path = None
 
-        for path in candidates:
-            if path and os.path.isfile(path) and os.access(path, os.X_OK):
-                self._log(f"Binaire Firefox trouvé : {path}")
-                return path
+        try:
+            # Copier le fichier pour éviter le verrou SQLite de Firefox
+            tmp_dir = tempfile.mkdtemp()
+            tmp_path = os.path.join(tmp_dir, "cookies.sqlite")
+            shutil.copy2(cookies_db, tmp_path)
 
-        self._log(
-            "Binaire Firefox introuvable. "
-            "Installez Firefox : sudo apt install firefox",
-            "error",
-        )
-        return None
+            conn = sqlite3.connect(tmp_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            # Extraire les cookies du domaine starlink.com non expirés
+            cursor.execute(
+                "SELECT name, value, host, path, expiry, isSecure, isHttpOnly "
+                "FROM moz_cookies WHERE host LIKE '%starlink.com%'"
+            )
+
+            now = int(time.time())
+            for row in cursor.fetchall():
+                # Ignorer les cookies expirés (expiry=0 = session, donc valide)
+                if row["expiry"] != 0 and row["expiry"] < now:
+                    continue
+                cookies.append({
+                    "name": row["name"],
+                    "value": row["value"],
+                    "domain": row["host"],
+                    "path": row["path"],
+                    "secure": bool(row["isSecure"]),
+                })
+
+            conn.close()
+            self._log(f"{len(cookies)} cookies Starlink extraits du profil Firefox")
+
+        except Exception as e:
+            self._log(f"Erreur lecture cookies.sqlite : {e}", "error")
+
+        finally:
+            # Nettoyer le fichier temporaire
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                    os.rmdir(os.path.dirname(tmp_path))
+                except OSError:
+                    pass
+
+        return cookies
 
     def launch(self) -> bool:
         """
-        Lance Firefox avec le profil configuré.
-        Si Firefox est déjà ouvert et réactif, le réutilise.
-        Retourne True si le navigateur est prêt.
+        Vérifie que le profil Firefox existe.
+        Retourne True si le profil est accessible.
         """
-        # Réutiliser le navigateur existant
-        if self.is_alive:
-            self._log("Firefox déjà ouvert, réutilisation")
-            return True
-
         profile_path = self._find_profile_path()
         if not profile_path:
-            self._log("Impossible de lancer Firefox sans profil valide", "error")
+            self._log("Impossible de trouver le profil Firefox", "error")
             return False
+
+        self._log("Profil Firefox prêt")
+        return True
+
+    def open_firefox_for_login(self):
+        """
+        Ouvre Firefox en mode normal (pas Selenium) avec le profil configuré
+        pour que l'utilisateur puisse se connecter manuellement sur starlink.com.
+        Firefox normal n'est pas détecté par hCaptcha.
+        """
+        profile_path = self._find_profile_path()
+        if not profile_path:
+            return
+
+        # Fermer une instance précédente si elle existe
+        self._close_firefox()
 
         try:
-            self._log("Lancement de Firefox...")
-            options = FirefoxOptions()
-            options.add_argument("-profile")
-            options.add_argument(profile_path)
-
-            # Spécifier le binaire Firefox explicitement (Snap, Flatpak, classique)
-            firefox_bin = self._find_firefox_binary()
-            if firefox_bin:
-                options.binary_location = firefox_bin
-
-            self.driver = webdriver.Firefox(options=options)
-            self.driver.get("https://www.starlink.com/account")
-
-            # Attendre le chargement initial de la page
-            time.sleep(5)
-            self._log("Firefox lancé avec succès")
-            return True
-
+            self._log("Ouverture de Firefox pour connexion manuelle...")
+            self._firefox_process = subprocess.Popen(
+                [
+                    "firefox",
+                    "-profile", profile_path,
+                    "https://www.starlink.com/account",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self._log("Firefox ouvert — connectez-vous puis cliquez 'Confirmer'")
+        except FileNotFoundError:
+            self._log(
+                "Firefox introuvable. Installez Firefox et connectez-vous "
+                "manuellement sur starlink.com",
+                "error",
+            )
         except Exception as e:
-            self._log(f"Erreur lancement Firefox : {e}", "error")
-            self.driver = None
-            return False
+            self._log(f"Erreur ouverture Firefox : {e}", "error")
+
+    def _close_firefox(self):
+        """Ferme proprement l'instance Firefox ouverte par l'app."""
+        if self._firefox_process and self._firefox_process.poll() is None:
+            try:
+                # SIGTERM pour un arrêt propre (flush des cookies sur disque)
+                self._firefox_process.terminate()
+                self._firefox_process.wait(timeout=10)
+                self._log("Firefox fermé (cookies sauvegardés)")
+            except subprocess.TimeoutExpired:
+                self._firefox_process.kill()
+                self._log("Firefox forcé à se fermer", "warning")
+            except Exception:
+                pass
+            self._firefox_process = None
 
     def is_logged_in(self) -> bool:
-        """Vérifie si l'utilisateur est connecté (cookie d'authentification présent)."""
-        if not self.is_alive:
+        """Vérifie si le cookie d'authentification Starlink existe dans le profil."""
+        profile_path = self._find_profile_path()
+        if not profile_path:
             return False
-        try:
-            cookies = self.driver.get_cookies()
-            return any("Starlink.Com.Access" in c["name"] for c in cookies)
-        except Exception:
-            return False
+
+        cookies = self._read_cookies_from_sqlite(profile_path)
+
+        # Chercher le cookie d'auth Starlink (plusieurs noms possibles)
+        auth_keywords = ["access", "token", "auth"]
+        auth_cookie = None
+        for c in cookies:
+            name_lower = c["name"].lower()
+            # Ignorer les cookies OIDC intermédiaires (nonce, correlation)
+            if "nonce" in name_lower or "correlation" in name_lower:
+                continue
+            if any(kw in name_lower for kw in auth_keywords):
+                auth_cookie = c["name"]
+                break
+
+        if auth_cookie:
+            self._log(f"Cookie d'authentification trouvé : {auth_cookie}")
+            return True
+
+        # Debug : afficher les noms de cookies pour diagnostiquer
+        cookie_names = [c["name"] for c in cookies]
+        self._log(
+            f"Cookie d'authentification absent. "
+            f"Cookies trouvés : {', '.join(cookie_names)}",
+            "warning",
+        )
+        return False
 
     def get_cookies(self) -> requests.cookies.RequestsCookieJar:
         """
-        Extrait les cookies du navigateur pour les utiliser avec la bibliothèque requests.
-        Retourne un CookieJar vide si le navigateur n'est pas disponible.
+        Extrait les cookies Starlink du profil Firefox pour la bibliothèque requests.
+        Retourne un CookieJar vide si le profil n'est pas disponible.
         """
         cj = requests.cookies.RequestsCookieJar()
-        if not self.is_alive:
+        profile_path = self._find_profile_path()
+        if not profile_path:
             return cj
 
-        try:
-            selenium_cookies = self.driver.get_cookies()
-            for cookie in selenium_cookies:
-                cj.set(
-                    cookie["name"],
-                    cookie["value"],
-                    domain=cookie.get("domain", ".starlink.com"),
-                )
-        except Exception as e:
-            self._log(f"Erreur extraction cookies : {e}", "error")
+        for cookie in self._read_cookies_from_sqlite(profile_path):
+            cj.set(
+                cookie["name"],
+                cookie["value"],
+                domain=cookie["domain"],
+                path=cookie["path"],
+            )
 
         return cj
 
     def refresh_session(self):
-        """Rafraîchit la session en rechargeant la page account."""
-        if not self.is_alive:
-            return
-        try:
-            self.driver.get("https://www.starlink.com/account")
-            time.sleep(5)
-            self._log("Session Firefox rafraîchie")
-        except Exception as e:
-            self._log(f"Erreur rafraîchissement session : {e}", "warning")
+        """
+        Ferme Firefox (pour flush des cookies) puis relit depuis le profil.
+        """
+        # Fermer Firefox pour que les cookies soient écrits sur disque
+        self._close_firefox()
+        # Attendre un instant pour que le fichier soit libéré
+        time.sleep(2)
+
+        self._log("Relecture des cookies depuis le profil Firefox...")
+        profile_path = self._find_profile_path()
+        if profile_path:
+            cookies = self._read_cookies_from_sqlite(profile_path)
+            if cookies:
+                self._log(f"Session rafraîchie : {len(cookies)} cookies")
+            else:
+                self._log("Aucun cookie trouvé — reconnectez-vous dans Firefox", "warning")
 
     def quit(self):
-        """Ferme proprement le navigateur Firefox."""
-        if self.driver:
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
-            self.driver = None
-            self._log("Firefox fermé")
+        """Ferme Firefox si ouvert et nettoie."""
+        self._close_firefox()
+        self._log("Session terminée")

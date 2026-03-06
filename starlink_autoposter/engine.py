@@ -1,7 +1,7 @@
 """
 Moteur de traitement automatique des abonnements Starlink.
-Exécute les cycles de requêtes dans un thread séparé,
-gère la navigation UI Selenium et les appels API.
+Exécute les cycles de requêtes dans un thread séparé.
+Utilise les cookies Firefox (lecture SQLite directe) pour les appels API.
 Communique avec la GUI via une file de messages (queue.Queue).
 """
 
@@ -14,9 +14,6 @@ from typing import Optional, Dict, Any
 
 import requests
 import urllib3
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
 from starlink_autoposter.config import AppConfig, Target
 from starlink_autoposter.browser import BrowserManager
@@ -33,6 +30,11 @@ MSG_STATS = "stats"                    # Mise à jour des statistiques
 MSG_LOGIN_REQUIRED = "login_required"  # Demande de connexion utilisateur
 MSG_CYCLE_DONE = "cycle_done"          # Cycle terminé
 MSG_STOPPED = "stopped"                # Moteur arrêté
+
+# User-Agent réaliste (Firefox sur Linux)
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+)
 
 
 class EngineStats:
@@ -64,7 +66,8 @@ class StarlinkEngine:
     """
     Moteur principal de l'application.
     Exécute les cycles de requêtes dans un thread séparé.
-    Communique avec la GUI via self.message_queue.
+    Lit les cookies depuis le profil Firefox (SQLite) et envoie
+    les requêtes API directement via requests (pas de Selenium).
     """
 
     def __init__(self, config: AppConfig):
@@ -126,7 +129,7 @@ class StarlinkEngine:
         """
         self._log("Moteur démarré")
 
-        # Initialiser le gestionnaire de navigateur
+        # Initialiser le gestionnaire de cookies Firefox
         self.browser = BrowserManager(
             profile_name=self.config.firefox_profile,
             log_callback=self._log,
@@ -173,14 +176,16 @@ class StarlinkEngine:
         self._log(f"=== Cycle {cycle_num} ===")
         self._emit(MSG_STATUS, "running")
 
-        # 1. Lancer Firefox
+        # 1. Vérifier le profil Firefox
         if not self.browser.launch():
-            self._log("Impossible de lancer Firefox", "error")
+            self._log("Profil Firefox introuvable", "error")
             return
 
         # 2. Vérifier la connexion (demander le login si nécessaire)
         if not self.browser.is_logged_in():
-            self._log("Connexion requise — veuillez vous connecter dans Firefox")
+            # Ouvrir Firefox automatiquement pour que l'utilisateur se connecte
+            self.browser.open_firefox_for_login()
+            self._log("Connectez-vous dans Firefox puis cliquez 'Confirmer'")
             self._emit(MSG_LOGIN_REQUIRED, None)
 
             # Attendre que la GUI confirme le login
@@ -190,11 +195,16 @@ class StarlinkEngine:
             if not self._running:
                 return
 
-            # Rafraîchir les cookies après login
+            # Fermer Firefox et relire les cookies depuis le disque
             self.browser.refresh_session()
 
             if not self.browser.is_logged_in():
-                self._log("Connexion échouée après confirmation", "error")
+                self._log("Cookie d'authentification toujours absent après confirmation", "error")
+                self._log(
+                    "Astuce : connectez-vous dans Firefox, attendez que la page "
+                    "account s'affiche, puis cliquez Confirmer",
+                    "warning",
+                )
                 return
 
         # 3. Traiter les cibles
@@ -236,152 +246,39 @@ class StarlinkEngine:
 
     def _process_account(self, target: Target) -> bool:
         """
-        Traite un compte via la séquence d'automatisation UI :
-        1. Naviguer vers account/home
-        2. Cliquer sur l'avatar utilisateur
-        3. Ouvrir le sélecteur de compte
-        4. Sélectionner le kit par ACC-ID
-        5. Cliquer sur "Votre abonnement"
-        6. Envoyer le POST de changement de produit via requests
+        Envoie le POST de changement de produit via l'API Starlink.
+        Utilise les cookies extraits du profil Firefox (pas de Selenium).
 
         Retourne True si le POST a réussi, False sinon.
         """
-        driver = self.browser.driver
-        if not driver:
-            self._log("   Navigateur non disponible", "error")
-            return False
-
         try:
-            wait = WebDriverWait(driver, 15)
-
-            # --- Étape 1 : Navigation vers account/home ---
-            self._log("   Étape 1 : Navigation account/home")
-            driver.get("https://www.starlink.com/account/home")
-            time.sleep(5)
-
-            # --- Étape 2 : Clic sur l'avatar utilisateur ---
-            self._log("   Étape 2 : Clic avatar")
-            try:
-                avatar = wait.until(EC.element_to_be_clickable((
-                    By.CSS_SELECTOR,
-                    "button[aria-label='user profile'], "
-                    "div.MuiAvatar-root.MuiAvatar-circular"
-                )))
-                driver.execute_script("arguments[0].click();", avatar)
-                time.sleep(2)
-            except Exception:
-                self._log("   Avatar non trouvé, poursuite...", "warning")
-
-            # --- Étape 3 : Ouvrir le sélecteur de compte (combobox MUI) ---
-            self._log("   Étape 3 : Sélecteur de compte")
-            try:
-                combobox_selectors = [
-                    "li[role='combobox']",
-                    "li.MuiMenuItem-root[role='combobox']",
-                    "li.MuiButtonBase-root.MuiMenuItem-root",
-                ]
-                combobox = None
-                for sel in combobox_selectors:
-                    try:
-                        combobox = driver.find_element(By.CSS_SELECTOR, sel)
-                        if combobox:
-                            break
-                    except Exception:
-                        continue
-
-                if combobox:
-                    driver.execute_script("arguments[0].click();", combobox)
-                    time.sleep(2)
-                else:
-                    self._log("   Sélecteur de compte non trouvé, poursuite...", "warning")
-
-            except Exception as e:
-                self._log(f"   Erreur sélecteur de compte : {e}", "warning")
-
-            # --- Étape 4 : Sélectionner le kit par ACC-ID dans la liste déroulante ---
-            self._log(f"   Étape 4 : Recherche kit {target.acc_id}")
-            try:
-                # Sélecteurs XPath pour trouver le kit dans le menu MUI
-                kit_selectors = [
-                    f"//li[contains(@class, 'MuiMenuItem-root')][.//p[contains(text(), '{target.acc_id}')]]",
-                    f"//li[contains(@class, 'MuiButtonBase-root')][.//p[contains(text(), '{target.acc_id}')]]",
-                    f"//li[contains(., '{target.acc_id}')]",
-                    f"//*[contains(text(), '{target.acc_id}')]/ancestor::li",
-                ]
-                kit_elem = None
-                for sel in kit_selectors:
-                    try:
-                        kit_elem = driver.find_element(By.XPATH, sel)
-                        if kit_elem:
-                            break
-                    except Exception:
-                        continue
-
-                if kit_elem:
-                    driver.execute_script("arguments[0].click();", kit_elem)
-                    time.sleep(3)
-                else:
-                    self._log(f"   Kit {target.acc_id} non trouvé dans la liste", "warning")
-                    return False
-
-            except Exception as e:
-                self._log(f"   Erreur sélection kit : {e}", "warning")
-
-            # --- Étape 5 : Cliquer sur "Votre abonnement" ---
-            self._log("   Étape 5 : Votre abonnement")
-            abonnement_selectors = [
-                "//p[contains(text(), 'Votre abonnement')]",
-                "//div[contains(., 'Votre abonnement') and contains(., 'Gérer le service')]",
-                "//*[contains(text(), 'Votre abonnement')]",
-            ]
-            abonnement_elem = None
-            for sel in abonnement_selectors:
-                try:
-                    abonnement_elem = wait.until(
-                        EC.element_to_be_clickable((By.XPATH, sel))
-                    )
-                    if abonnement_elem:
-                        break
-                except Exception:
-                    continue
-
-            if not abonnement_elem:
-                self._log("   'Votre abonnement' non trouvé", "warning")
+            # Récupérer les cookies depuis le profil Firefox
+            cookie_jar = self.browser.get_cookies()
+            if not cookie_jar:
+                self._log("   Aucun cookie disponible", "error")
                 return False
 
-            driver.execute_script("arguments[0].click();", abonnement_elem)
-            time.sleep(3)
-
-            # --- Étape 6 : POST de changement de produit via requests ---
-            current_url = driver.current_url
-            self._log("   Étape 6 : POST changement de produit")
-
+            # URL de l'API de changement de produit
             post_url = (
                 f"https://www.starlink.com/api/webagg/v1/public/subscriptions/line/"
                 f"{target.line_id}/product/{target.product}?schedule=false"
             )
 
-            # Créer une session requests avec les cookies du navigateur
-            session = requests.Session()
-            for cookie in driver.get_cookies():
-                session.cookies.set(
-                    cookie["name"],
-                    cookie["value"],
-                    domain=cookie.get("domain", ".starlink.com"),
-                )
-
-            # Headers identiques à ceux du navigateur
+            # Headers reproduisant ceux d'un navigateur Firefox
             headers = {
                 "Accept": "application/json",
                 "Content-Type": "application/json",
                 "Origin": "https://www.starlink.com",
-                "Referer": current_url,
-                "User-Agent": driver.execute_script("return navigator.userAgent;"),
+                "Referer": "https://www.starlink.com/account/home",
+                "User-Agent": DEFAULT_USER_AGENT,
             }
 
-            response = session.post(
+            self._log(f"   POST {target.product} pour {target.acc_id}...")
+
+            response = requests.post(
                 post_url,
                 headers=headers,
+                cookies=cookie_jar,
                 json={},
                 verify=False,
                 timeout=self.config.timeout_seconds,
@@ -394,8 +291,10 @@ class StarlinkEngine:
                 self._log(f"   POST réussi ({status})")
                 return True
             elif status == 401:
-                self._log("   Token expiré (401) — rafraîchissement nécessaire", "warning")
-                self.browser.refresh_session()
+                self._log(
+                    "   Token expiré (401) — reconnectez-vous dans Firefox",
+                    "warning",
+                )
                 return False
             elif status == 403:
                 self._log(f"   Accès refusé (403) : {response.text[:200]}", "warning")
