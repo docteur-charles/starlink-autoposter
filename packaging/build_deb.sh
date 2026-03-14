@@ -59,13 +59,15 @@ mkdir -p "${DEB_ROOT}/DEBIAN"
 mkdir -p "${DEB_ROOT}/usr/bin"
 mkdir -p "${DEB_ROOT}/usr/share/applications"
 mkdir -p "${DEB_ROOT}/usr/share/doc/${PKG_NAME}"
+mkdir -p "${DEB_ROOT}/etc/xdg/autostart"
 
 # 4. Copier le binaire
 cp "${DIST_DIR}/starlink-autoposter" "${DEB_ROOT}/usr/bin/"
 chmod 755 "${DEB_ROOT}/usr/bin/starlink-autoposter"
 
-# 5. Copier le fichier .desktop (entrée dans le menu)
+# 5. Copier le fichier .desktop (menu + autostart au démarrage)
 cp "${SCRIPT_DIR}/starlink-autoposter.desktop" "${DEB_ROOT}/usr/share/applications/"
+cp "${SCRIPT_DIR}/starlink-autoposter.desktop" "${DEB_ROOT}/etc/xdg/autostart/"
 
 # 6. Fichier de contrôle Debian
 cat > "${DEB_ROOT}/DEBIAN/control" << EOF
