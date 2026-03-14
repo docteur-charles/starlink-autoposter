@@ -278,6 +278,9 @@ class App(ctk.CTk):
         # Gérer la fermeture propre de la fenêtre
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # Démarrer le moteur automatiquement après le rendu de la fenêtre
+        self.after(500, self._auto_start)
+
     def _load_icon(self):
         """Charge le logo Saadaw Systems comme icône de la fenêtre et du header."""
         from PIL import ImageTk
@@ -776,6 +779,11 @@ class App(ctk.CTk):
     # ========================================
     # Contrôle du moteur
     # ========================================
+
+    def _auto_start(self):
+        """Démarre le moteur automatiquement au lancement si des cibles existent."""
+        if self.config.get_targets():
+            self._start_engine()
 
     def _start_engine(self):
         """Démarre le moteur de traitement."""
