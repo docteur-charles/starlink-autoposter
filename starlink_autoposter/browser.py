@@ -65,11 +65,13 @@ class BrowserManager:
         """
         Recherche le chemin du profil Firefox correspondant au nom configuré.
         Parcourt tous les emplacements possibles (classique, Snap, Flatpak).
+        Privilégie les profils contenant cookies.sqlite (profils actifs).
         """
         if self._profile_path and os.path.isdir(self._profile_path):
             return self._profile_path
 
         tried_dirs = []
+        all_matches = []
 
         for base in self._get_firefox_base_dirs():
             if not os.path.isdir(base):
@@ -77,21 +79,30 @@ class BrowserManager:
                 continue
 
             matches = glob.glob(os.path.join(base, f"*{self.profile_name}*"))
-            if matches:
-                self._log(f"Profil Firefox trouvé : {matches[0]}")
-                self._profile_path = matches[0]
-                return matches[0]
-
+            all_matches.extend(matches)
             tried_dirs.append(base)
 
-        self._log(
-            f"Profil Firefox '{self.profile_name}' non trouvé. "
-            f"Emplacements vérifiés : {', '.join(tried_dirs)}. "
-            "Créez un profil Firefox nommé ainsi via about:profiles "
-            "ou changez le nom dans la configuration.",
-            "warning",
-        )
-        return None
+        if not all_matches:
+            self._log(
+                f"Profil Firefox '{self.profile_name}' non trouvé. "
+                f"Emplacements vérifiés : {', '.join(tried_dirs)}. "
+                "Créez un profil Firefox nommé ainsi via about:profiles "
+                "ou changez le nom dans la configuration.",
+                "warning",
+            )
+            return None
+
+        # Privilégier les profils qui contiennent cookies.sqlite (profils actifs)
+        for match in all_matches:
+            if os.path.isfile(os.path.join(match, "cookies.sqlite")):
+                self._log(f"Profil Firefox trouvé : {match}")
+                self._profile_path = match
+                return match
+
+        # Aucun profil avec cookies.sqlite, prendre le premier
+        self._log(f"Profil Firefox trouvé (sans cookies) : {all_matches[0]}")
+        self._profile_path = all_matches[0]
+        return all_matches[0]
 
     def _read_cookies_from_sqlite(self, profile_path: str) -> List[Dict]:
         """
@@ -166,6 +177,24 @@ class BrowserManager:
         self._log("Profil Firefox prêt")
         return True
 
+    def _find_firefox_binary(self) -> str:
+        """
+        Retourne le chemin du binaire Firefox selon l'OS.
+        Windows : Program Files. Linux : commande firefox dans le PATH.
+        """
+        if os.name == "nt":
+            # Chemins possibles sur Windows (64-bit et 32-bit)
+            candidates = [
+                os.path.join(os.environ.get("PROGRAMFILES", ""), "Mozilla Firefox", "firefox.exe"),
+                os.path.join(os.environ.get("PROGRAMFILES(X86)", ""), "Mozilla Firefox", "firefox.exe"),
+                os.path.join(os.environ.get("LOCALAPPDATA", ""), "Mozilla Firefox", "firefox.exe"),
+            ]
+            for path in candidates:
+                if os.path.isfile(path):
+                    return path
+        # Linux / macOS : firefox dans le PATH
+        return "firefox"
+
     def open_firefox_for_login(self):
         """
         Ouvre Firefox en mode normal (pas Selenium) avec le profil configuré
@@ -180,10 +209,11 @@ class BrowserManager:
         self._close_firefox()
 
         try:
+            firefox_bin = self._find_firefox_binary()
             self._log("Ouverture de Firefox pour connexion manuelle...")
             self._firefox_process = subprocess.Popen(
                 [
-                    "firefox",
+                    firefox_bin,
                     "-profile", profile_path,
                     "https://www.starlink.com/account",
                 ],
